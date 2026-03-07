@@ -117,17 +117,26 @@ class RelaySession {
           },
 
           onmessage: (msg) => {
-            // Top-level audio shorthand (some SDK versions)
-            if (msg.data) {
-              this._send({ type: "audio", data: msg.data });
-            }
+            // Guard: track whether we already forwarded audio for this message.
+            // The SDK sometimes populates BOTH msg.data (shorthand) AND
+            // serverContent.modelTurn.parts[].inlineData.data with the same
+            // audio bytes. Sending both causes the browser to schedule each
+            // chunk twice, producing overlapping / doubled audio (glitch).
+            let audioForwarded = false;
 
-            // Nested parts inside serverContent
+            // Prefer the structured serverContent path (canonical format).
             const parts = msg.serverContent?.modelTurn?.parts ?? [];
             for (const part of parts) {
               if (part.inlineData?.data) {
                 this._send({ type: "audio", data: part.inlineData.data });
+                audioForwarded = true;
               }
+            }
+
+            // Only fall back to the top-level shorthand if nothing came
+            // through the parts — avoids the double-send.
+            if (!audioForwarded && msg.data) {
+              this._send({ type: "audio", data: msg.data });
             }
 
             if (msg.serverContent?.turnComplete) {

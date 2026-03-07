@@ -74,6 +74,7 @@ export function useAudioSession() {
   const wsRef              = useRef<WebSocket | null>(null);
   const audioCtxRef        = useRef<AudioContext | null>(null);
   const workletNodeRef     = useRef<AudioWorkletNode | null>(null);
+  const silentGainRef      = useRef<GainNode | null>(null);
   const micStreamRef       = useRef<MediaStream | null>(null);
 
   // Playback scheduling: next available start time in AudioContext seconds
@@ -90,6 +91,13 @@ export function useAudioSession() {
   function scheduleAudio(base64: string) {
     const ctx = audioCtxRef.current;
     if (!ctx || isMutedRef.current) return;
+
+    // Resume the AudioContext if the browser suspended it (autoplay policy).
+    // Creating an AudioContext on mount (without a user gesture) leaves it in
+    // "suspended" state; source.start() silently queues but nothing plays.
+    if (ctx.state === "suspended") {
+      ctx.resume().catch(err => console.warn("[useAudioSession] ctx.resume failed:", err));
+    }
 
     let audioBuffer: AudioBuffer;
     try {
@@ -189,6 +197,12 @@ export function useAudioSession() {
     newWs.onerror   = (e) => console.error("[useAudioSession] WS error:", e);
 
     newWs.onclose = () => {
+      // Ignore stale close events from a superseded WebSocket instance.
+      // React StrictMode unmounts+remounts in dev: cleanup closes ws1 while
+      // the remount has already assigned ws2 to wsRef. When ws1's onclose
+      // fires asynchronously it must not schedule another reconnect.
+      if (wsRef.current !== newWs) return;
+
       wsRef.current = null;
       setIsConnected(false);
       console.log("[useAudioSession] WS closed");
@@ -211,6 +225,8 @@ export function useAudioSession() {
   function stopMic() {
     workletNodeRef.current?.disconnect();
     workletNodeRef.current = null;
+    silentGainRef.current?.disconnect();
+    silentGainRef.current = null;
     micStreamRef.current?.getTracks().forEach(t => t.stop());
     micStreamRef.current = null;
   }
@@ -241,6 +257,16 @@ export function useAudioSession() {
     const source  = ctx.createMediaStreamSource(stream);
     const worklet = new AudioWorkletNode(ctx, "mic-processor");
     workletNodeRef.current = worklet;
+
+    // The AudioWorklet node MUST be in the audio rendering graph — i.e. there
+    // must be a path to ctx.destination — otherwise browsers (especially Safari)
+    // won't invoke process() and the mic sends nothing.  We route through a
+    // gain=0 node so no mic audio reaches the speakers (prevents feedback).
+    const silentGain = ctx.createGain();
+    silentGain.gain.value = 0;
+    worklet.connect(silentGain);
+    silentGain.connect(ctx.destination);
+    silentGainRef.current = silentGain;
 
     worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
