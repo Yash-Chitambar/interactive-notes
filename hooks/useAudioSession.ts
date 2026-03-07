@@ -2,8 +2,11 @@
 
 // ============================================================
 // hooks/useAudioSession.ts
-// Manages mic capture, WebSocket relay to Gemini Live,
-// and audio playback. Receives canvas snapshots from Person 3.
+// Manages the browser side of the Gemini Live voice session:
+//   - WebSocket connection to ws-relay/server.js
+//   - Microphone capture via AudioWorklet (mic-processor)
+//   - PCM audio playback with a scheduling queue (no overlapping chunks)
+//   - Mute / isSpeaking state
 // ============================================================
 
 import { useState, useRef, useCallback, useEffect } from "react";
@@ -11,138 +14,146 @@ import { TranscriptEntry } from "@/types";
 
 const WS_URL = process.env.NEXT_PUBLIC_WS_RELAY_URL ?? "ws://localhost:8080";
 
-// Gemini returns PCM at 24 000 Hz, mono, 16-bit little-endian.
-const GEMINI_AUDIO_SAMPLE_RATE = 24_000;
-
-// We capture mic at 16 000 Hz PCM for Gemini.
+// Gemini returns 24 kHz mono 16-bit little-endian PCM
+const GEMINI_SAMPLE_RATE = 24_000;
+// We send 16 kHz mono 16-bit little-endian PCM to Gemini
 const MIC_SAMPLE_RATE = 16_000;
 
-// Reconnect back-off: attempt up to this many times before giving up.
 const MAX_RECONNECT_ATTEMPTS = 5;
-const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_BASE_MS = 1_000;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility helpers (module-level — no React deps)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function float32ToInt16(f32: Float32Array): ArrayBuffer {
+  const out = new Int16Array(f32.length);
+  for (let i = 0; i < f32.length; i++) {
+    const v = Math.max(-1, Math.min(1, f32[i]));
+    out[i] = v < 0 ? v * 32768 : v * 32767;
+  }
+  return out.buffer;
+}
+
+function toBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function base64ToPCMBuffer(base64: string, ctx: AudioContext): AudioBuffer {
+  const bin = atob(base64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+  const int16 = new Int16Array(bytes.buffer);
+  const audioBuffer = ctx.createBuffer(1, int16.length, GEMINI_SAMPLE_RATE);
+  const ch = audioBuffer.getChannelData(0);
+  for (let i = 0; i < int16.length; i++) {
+    ch[i] = int16[i] / (int16[i] < 0 ? 32768 : 32767);
+  }
+  return audioBuffer;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hook
+// ─────────────────────────────────────────────────────────────────────────────
 
 export function useAudioSession() {
-  const [isConnected, setIsConnected] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [isMuted, setIsMuted] = useState(false);
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [isConnected, setIsConnected]   = useState(false);
+  const [isListening, setIsListening]   = useState(false);
+  const [isMuted,     setIsMuted]       = useState(false);
+  const [isSpeaking,  setIsSpeaking]    = useState(false);
+  const [transcript,  setTranscript]    = useState<TranscriptEntry[]>([]);
 
-  const isMutedRef = useRef(false);
+  // Ref mirrors for values needed inside non-reactive callbacks
+  const isMutedRef    = useRef(false);
+  const isSpeakingRef = useRef(false);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const audioCtxRef = useRef<AudioContext | null>(null);
-  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const micStreamRef = useRef<MediaStream | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isManuallyClosed = useRef(false); // true when the user explicitly disconnects
+  const wsRef              = useRef<WebSocket | null>(null);
+  const audioCtxRef        = useRef<AudioContext | null>(null);
+  const workletNodeRef     = useRef<AudioWorkletNode | null>(null);
+  const micStreamRef       = useRef<MediaStream | null>(null);
 
-  // ------------------------------------------------------------------
-  // Audio utilities
-  // ------------------------------------------------------------------
+  // Playback scheduling: next available start time in AudioContext seconds
+  const nextPlayAtRef      = useRef(0);
+  // Debounce timer to clear isSpeaking after playback drains
+  const speakTimerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  /** Convert a Float32 PCM sample array to a 16-bit little-endian Int16 ArrayBuffer. */
-  function float32ToInt16(float32Buf: Float32Array): ArrayBuffer {
-    const int16 = new Int16Array(float32Buf.length);
-    for (let i = 0; i < float32Buf.length; i++) {
-      const clamped = Math.max(-1, Math.min(1, float32Buf[i]));
-      int16[i] = clamped < 0 ? clamped * 32768 : clamped * 32767;
-    }
-    return int16.buffer;
-  }
+  const reconnectCountRef  = useRef(0);
+  const reconnectTimerRef  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manuallyClosedRef  = useRef(false);
 
-  /** Convert an ArrayBuffer to a base64 string. */
-  function arrayBufferToBase64(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-  }
+  // ── Playback ──────────────────────────────────────────────────────────────
 
-  /** Decode base64 PCM (16-bit LE, 24 kHz mono) and play it via Web Audio. */
-  async function playPcmBase64(base64: string) {
+  function scheduleAudio(base64: string) {
     const ctx = audioCtxRef.current;
-    if (!ctx) return;
+    if (!ctx || isMutedRef.current) return;
 
+    let audioBuffer: AudioBuffer;
     try {
-      // Decode base64 -> raw bytes
-      const binaryStr = atob(base64);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-      }
-
-      // Interpret as 16-bit little-endian PCM
-      const int16 = new Int16Array(bytes.buffer);
-      const numSamples = int16.length;
-
-      // Build a Web Audio AudioBuffer (1 channel, 24 000 Hz)
-      const audioBuf = ctx.createBuffer(1, numSamples, GEMINI_AUDIO_SAMPLE_RATE);
-      const channelData = audioBuf.getChannelData(0);
-      for (let i = 0; i < numSamples; i++) {
-        // Normalise to -1..1
-        channelData[i] = int16[i] / (int16[i] < 0 ? 32768 : 32767);
-      }
-
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuf;
-      source.connect(ctx.destination);
-      source.start();
+      audioBuffer = base64ToPCMBuffer(base64, ctx);
     } catch (err) {
-      console.error("[useAudioSession] Audio playback error:", err);
+      console.error("[useAudioSession] Failed to decode audio chunk:", err);
+      return;
     }
+
+    // Keep chunks sequential even if they arrive faster than they play
+    const now = ctx.currentTime;
+    if (nextPlayAtRef.current < now) nextPlayAtRef.current = now;
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    source.start(nextPlayAtRef.current);
+    nextPlayAtRef.current += audioBuffer.duration;
+
+    // Mark tutor as speaking
+    if (!isSpeakingRef.current) {
+      isSpeakingRef.current = true;
+      setIsSpeaking(true);
+    }
+
+    // Schedule a timer to clear isSpeaking once the queue drains
+    if (speakTimerRef.current) clearTimeout(speakTimerRef.current);
+    const msUntilDone = Math.max(0, (nextPlayAtRef.current - ctx.currentTime) * 1000) + 200;
+    speakTimerRef.current = setTimeout(() => {
+      isSpeakingRef.current = false;
+      setIsSpeaking(false);
+    }, msUntilDone);
   }
 
-  // ------------------------------------------------------------------
-  // WebSocket helpers
-  // ------------------------------------------------------------------
+  // ── WebSocket ─────────────────────────────────────────────────────────────
 
-  function sendJson(obj: unknown) {
+  function sendWs(obj: unknown) {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(obj));
     }
   }
 
-  // ------------------------------------------------------------------
-  // Message handler
-  // ------------------------------------------------------------------
-
-  function handleMessage(event: MessageEvent) {
-    let msg: { type: string; [key: string]: unknown };
-    try {
-      msg = JSON.parse(event.data as string);
-    } catch {
-      return;
-    }
+  function onWsMessage(event: MessageEvent) {
+    let msg: { type: string; [k: string]: unknown };
+    try { msg = JSON.parse(event.data as string); } catch { return; }
 
     switch (msg.type) {
       case "connected":
-        // Gemini handshake confirmed by relay
+        // Relay confirmed Gemini handshake — nothing to do in UI
+        break;
+
+      case "audio":
+        if (msg.data) scheduleAudio(msg.data as string);
         break;
 
       case "transcript": {
         const role = (msg.role as TranscriptEntry["role"]) ?? "tutor";
         const text = (msg.text as string) ?? "";
-        setTranscript((prev) => [
-          ...prev,
-          { role, text, timestamp: Date.now() },
-        ]);
-        break;
-      }
-
-      case "audio": {
-        // Relay sends { type: "audio", data: "<base64 PCM>", mimeType: "audio/pcm;rate=24000" }
-        const base64 = msg.data as string;
-        if (base64 && !isMutedRef.current) {
-          playPcmBase64(base64);
-        }
+        if (text) setTranscript(prev => [...prev, { role, text, timestamp: Date.now() }]);
         break;
       }
 
       case "turn_complete":
-        // Gemini finished its turn — nothing extra needed in UI currently
+        // Could be used to trigger UI feedback — reserved for future use
         break;
 
       case "error":
@@ -154,253 +165,184 @@ export function useAudioSession() {
     }
   }
 
-  // ------------------------------------------------------------------
-  // Connect / reconnect
-  // ------------------------------------------------------------------
-
   const connect = useCallback(() => {
-    // Don't open a second connection if one is alive
-    if (
-      wsRef.current &&
-      (wsRef.current.readyState === WebSocket.OPEN ||
-        wsRef.current.readyState === WebSocket.CONNECTING)
-    ) {
-      return;
-    }
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) return;
 
-    isManuallyClosed.current = false;
+    manuallyClosedRef.current = false;
 
-    // Ensure we have an AudioContext
     if (!audioCtxRef.current || audioCtxRef.current.state === "closed") {
       audioCtxRef.current = new AudioContext();
     }
 
-    console.log("[useAudioSession] Connecting to relay:", WS_URL);
-    const ws = new WebSocket(WS_URL);
-    wsRef.current = ws;
+    console.log("[useAudioSession] Connecting to", WS_URL);
+    const newWs = new WebSocket(WS_URL);
+    wsRef.current = newWs;
 
-    ws.onopen = () => {
-      console.log("[useAudioSession] WS open");
-      reconnectAttemptsRef.current = 0;
+    newWs.onopen = () => {
+      reconnectCountRef.current = 0;
       setIsConnected(true);
+      console.log("[useAudioSession] Connected");
     };
 
-    ws.onmessage = handleMessage;
+    newWs.onmessage = onWsMessage;
+    newWs.onerror   = (e) => console.error("[useAudioSession] WS error:", e);
 
-    ws.onerror = (err) => {
-      console.error("[useAudioSession] WS error:", err);
-    };
-
-    ws.onclose = () => {
-      console.log("[useAudioSession] WS closed");
+    newWs.onclose = () => {
       wsRef.current = null;
       setIsConnected(false);
-      // Stop mic only if we won't reconnect (manually closed or max retries)
-      // so a brief relay hiccup doesn't kill an active mic session
-      if (isManuallyClosed.current || reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      console.log("[useAudioSession] WS closed");
+
+      if (manuallyClosedRef.current || reconnectCountRef.current >= MAX_RECONNECT_ATTEMPTS) {
         setIsListening(false);
-        stopMicCapture();
+        stopMic();
+        return;
       }
 
-      if (
-        !isManuallyClosed.current &&
-        reconnectAttemptsRef.current < MAX_RECONNECT_ATTEMPTS
-      ) {
-        const delay =
-          RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttemptsRef.current;
-        reconnectAttemptsRef.current++;
-        console.log(
-          `[useAudioSession] Reconnecting in ${delay} ms (attempt ${reconnectAttemptsRef.current})`
-        );
-        reconnectTimerRef.current = setTimeout(connect, delay);
-      } else if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-        console.error("[useAudioSession] Max reconnect attempts reached");
-      }
+      const delay = RECONNECT_BASE_MS * 2 ** reconnectCountRef.current;
+      reconnectCountRef.current++;
+      console.log(`[useAudioSession] Reconnecting in ${delay}ms (attempt ${reconnectCountRef.current})`);
+      reconnectTimerRef.current = setTimeout(connect, delay);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ------------------------------------------------------------------
-  // Mic capture via ScriptProcessorNode (works everywhere, no worklet needed)
-  // ------------------------------------------------------------------
+  // ── Mic capture via AudioWorklet ─────────────────────────────────────────
 
-  function stopMicCapture() {
-    if (scriptProcessorRef.current) {
-      scriptProcessorRef.current.disconnect();
-      scriptProcessorRef.current.onaudioprocess = null;
-      scriptProcessorRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-    }
+  function stopMic() {
+    workletNodeRef.current?.disconnect();
+    workletNodeRef.current = null;
+    micStreamRef.current?.getTracks().forEach(t => t.stop());
+    micStreamRef.current = null;
   }
 
-  async function startMicCapture() {
+  async function startMic() {
     const ctx = audioCtxRef.current;
-    if (!ctx) {
-      console.error("[useAudioSession] AudioContext not available");
-      return;
-    }
+    if (!ctx) throw new Error("AudioContext not initialised");
 
-    console.log("[useAudioSession] AudioContext state:", ctx.state, "sampleRate:", ctx.sampleRate);
+    if (ctx.state === "suspended") await ctx.resume();
 
-    // Resume suspended context (required after user gesture)
-    if (ctx.state === "suspended") {
-      await ctx.resume();
-      console.log("[useAudioSession] AudioContext resumed, state:", ctx.state);
-    }
+    // Load the worklet module (served from public/worklets/)
+    await ctx.audioWorklet.addModule("/worklets/mic-processor.js");
 
-    // Don't request sampleRate — Chrome on macOS ignores/rejects it.
-    // We resample to 16kHz manually below.
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     });
     micStreamRef.current = stream;
-    console.log("[useAudioSession] Got mic stream, tracks:", stream.getAudioTracks().map(t => `${t.label} (${t.readyState})`));
 
-    // Stop mic cleanly if the track ends unexpectedly
+    // Stop listening cleanly if the track ends unexpectedly (e.g. device unplugged)
     stream.getAudioTracks().forEach(track => {
       track.onended = () => {
         console.warn("[useAudioSession] Mic track ended unexpectedly");
-        stopMicCapture();
+        stopMic();
         setIsListening(false);
       };
     });
 
-    const source = ctx.createMediaStreamSource(stream);
+    const source  = ctx.createMediaStreamSource(stream);
+    const worklet = new AudioWorkletNode(ctx, "mic-processor");
+    workletNodeRef.current = worklet;
 
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    scriptProcessorRef.current = processor;
-
-    let chunkCount = 0;
-    processor.onaudioprocess = (e) => {
+    worklet.port.onmessage = (e: MessageEvent<Float32Array>) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-      chunkCount++;
-      if (chunkCount <= 3) console.log("[useAudioSession] onaudioprocess firing, chunk", chunkCount);
 
-      // Get mono float32 samples from the mic
-      const float32 = e.inputBuffer.getChannelData(0);
+      let samples: Float32Array = e.data;
 
-      // Resample if the AudioContext sample rate differs from 16 kHz.
-      // Most browsers will honour the sampleRate constraint, but this is a
-      // simple linear-interpolation fallback just in case.
-      let samples = float32;
-      const ctxRate = ctx.sampleRate;
-      if (ctxRate !== MIC_SAMPLE_RATE) {
-        const ratio = ctxRate / MIC_SAMPLE_RATE;
-        const outLength = Math.round(float32.length / ratio);
-        const resampled = new Float32Array(outLength);
-        for (let i = 0; i < outLength; i++) {
-          resampled[i] = float32[Math.min(Math.round(i * ratio), float32.length - 1)];
+      // Downsample to 16 kHz if the AudioContext runs at a different rate
+      if (ctx.sampleRate !== MIC_SAMPLE_RATE) {
+        const ratio    = ctx.sampleRate / MIC_SAMPLE_RATE;
+        const outLen   = Math.round(samples.length / ratio);
+        const resampled = new Float32Array(outLen);
+        for (let i = 0; i < outLen; i++) {
+          resampled[i] = samples[Math.min(Math.round(i * ratio), samples.length - 1)];
         }
         samples = resampled;
       }
 
-      const pcmBuffer = float32ToInt16(samples);
-      const base64 = arrayBufferToBase64(pcmBuffer);
-
-      wsRef.current!.send(
-        JSON.stringify({ type: "audio_chunk", data: base64 })
-      );
+      const pcm    = float32ToInt16(samples);
+      const base64 = toBase64(pcm);
+      wsRef.current!.send(JSON.stringify({ type: "audio_chunk", data: base64 }));
     };
 
-    source.connect(processor);
-    // Connect to destination with silent gain=0 so the browser doesn't echo
-    const silentGain = ctx.createGain();
-    silentGain.gain.value = 0;
-    processor.connect(silentGain);
-    silentGain.connect(ctx.destination);
+    // Connect source → worklet (worklet doesn't need to reach destination)
+    source.connect(worklet);
   }
 
-  // ------------------------------------------------------------------
-  // Public API
-  // ------------------------------------------------------------------
+  // ── Public API ────────────────────────────────────────────────────────────
 
-  /** Toggle microphone capture on/off. Auto-connects WS if needed. */
+  /** Toggle microphone capture on/off. Initiates a WS connection if not yet connected. */
   const toggleMic = useCallback(async () => {
     if (isListening) {
-      stopMicCapture();
+      stopMic();
       setIsListening(false);
       return;
     }
 
-    // Must be connected to relay before mic can stream
     if (!isConnected) {
       connect();
-      console.warn("[useAudioSession] Relay not connected yet — try mic again once connected");
+      // Relay connecting — user needs to tap again once connected
       return;
     }
 
     try {
-      await startMicCapture();
+      await startMic();
       setIsListening(true);
     } catch (err) {
-      console.error("[useAudioSession] Mic access error:", err);
+      console.error("[useAudioSession] Failed to start mic:", err);
     }
-  }, [isConnected, isListening, connect]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [isListening, isConnected, connect]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  /** Send the latest canvas frame to the relay (throttled server-side too). */
+  /** Mute/unmute Gemini audio output. Does not affect mic capture. */
+  const toggleMute = useCallback(() => {
+    isMutedRef.current = !isMutedRef.current;
+    setIsMuted(isMutedRef.current);
+
+    // If muting while the tutor is mid-speech, clear isSpeaking immediately
+    if (isMutedRef.current) {
+      if (speakTimerRef.current) clearTimeout(speakTimerRef.current);
+      isSpeakingRef.current = false;
+      setIsSpeaking(false);
+    }
+  }, []);
+
+  /** Forward the current canvas frame to Gemini (throttled server-side). */
   const sendCanvasSnapshot = useCallback((dataUrl: string) => {
-    sendJson({ type: "canvas_snapshot", image: dataUrl });
+    sendWs({ type: "canvas_snapshot", image: dataUrl });
   }, []);
 
-  /** Send a typed student message. */
+  /** Inject a text message into the Gemini conversation. */
   const sendTextMessage = useCallback((text: string) => {
-    if (!text.trim()) return;
-    sendJson({ type: "text", text: text.trim() });
+    if (text.trim()) sendWs({ type: "text", text: text.trim() });
   }, []);
 
-  /** Change the active subject — relay will reconnect Gemini with new system prompt. */
+  /** Change the active subject — causes the relay to reconnect Gemini with a new system prompt. */
   const setSubject = useCallback((subject: string) => {
-    sendJson({ type: "set_subject", subject });
+    sendWs({ type: "set_subject", subject });
   }, []);
 
-  /** Manually disconnect. */
-  const disconnect = useCallback(() => {
-    isManuallyClosed.current = true;
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-    }
-    stopMicCapture();
-    wsRef.current?.close();
-    wsRef.current = null;
-    setIsConnected(false);
-    setIsListening(false);
-  }, []);
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-  // Auto-connect on mount, clean up on unmount
   useEffect(() => {
     connect();
     return () => {
-      isManuallyClosed.current = true;
-      if (reconnectTimerRef.current) {
-        clearTimeout(reconnectTimerRef.current);
-      }
-      stopMicCapture();
+      manuallyClosedRef.current = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (speakTimerRef.current)     clearTimeout(speakTimerRef.current);
+      stopMic();
       wsRef.current?.close();
       audioCtxRef.current?.close();
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const toggleMute = useCallback(() => {
-    isMutedRef.current = !isMutedRef.current;
-    setIsMuted(isMutedRef.current);
-  }, []);
-
   return {
     isConnected,
     isListening,
     isMuted,
+    isSpeaking,
     transcript,
     toggleMic,
     toggleMute,
     sendCanvasSnapshot,
     sendTextMessage,
     setSubject,
-    disconnect,
   };
 }

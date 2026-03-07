@@ -61,7 +61,7 @@ export default function Home() {
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
 
   // Person 2: audio session
-  const { isConnected, isListening, isMuted, transcript, toggleMic, toggleMute, sendCanvasSnapshot, sendTextMessage } =
+  const { isConnected, isListening, isMuted, isSpeaking, transcript, toggleMic, toggleMute, sendCanvasSnapshot, sendTextMessage } =
     useAudioSession();
 
   // Overshoot: real-time camera vision
@@ -426,9 +426,10 @@ export default function Home() {
       {/* ── Audio bar (Person 2) ── */}
       <AudioBar
         transcript={transcript}
-        isListening={isListening}
         isConnected={isConnected}
+        isListening={isListening}
         isMuted={isMuted}
+        isSpeaking={isSpeaking}
         isCameraActive={isCameraActive}
         onToggleMic={toggleMic}
         onToggleMute={toggleMute}
