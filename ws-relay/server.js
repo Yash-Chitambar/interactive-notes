@@ -6,8 +6,7 @@
 //
 // Protocol (browser -> relay):
 //   { type: "audio_chunk",     data: "<base64 PCM 16kHz mono int16>" }
-//   { type: "canvas_snapshot", image: "<data URL png>" }
-//   { type: "text",            text: "..." }
+//   { type: "text",            text: "..." }   ← Overshoot sends LaTeX here
 //   { type: "set_subject",     subject: "math" | "physics" | ... }
 //
 // Protocol (relay -> browser):
@@ -27,8 +26,6 @@ const PORT = parseInt(process.env.WS_PORT ?? "8080", 10);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
 const MODEL = "gemini-2.5-flash-native-audio-latest";
 
-// Minimum ms between canvas frames forwarded to Gemini
-const CANVAS_THROTTLE_MS = 10_000;
 // Delay before reconnecting a dropped Gemini session
 const GEMINI_RECONNECT_MS = 2_000;
 
@@ -59,10 +56,6 @@ class RelaySession {
 
     // Gemini Live session handle (null until connected)
     this.gemini = null;
-
-    // Canvas throttling
-    this.lastCanvasSentAt = 0;
-    this.pendingCanvas = null; // base64 PNG waiting to be sent
 
     this.ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
 
@@ -110,10 +103,6 @@ class RelaySession {
           onopen: () => {
             console.log("[relay] Gemini Live connected");
             this._send({ type: "connected" });
-            // Flush any canvas snapshot that arrived before the session was ready
-            if (this.pendingCanvas) {
-              this._flushCanvas(this.pendingCanvas);
-            }
           },
 
           onmessage: (msg) => {
@@ -174,25 +163,6 @@ class RelaySession {
     }
   }
 
-  // ── Internal: canvas throttle ─────────────────────────────────────────────
-
-  _flushCanvas(base64) {
-    const now = Date.now();
-    if (!this.gemini || now - this.lastCanvasSentAt < CANVAS_THROTTLE_MS) {
-      this.pendingCanvas = base64;
-      return;
-    }
-    this.lastCanvasSentAt = now;
-    this.pendingCanvas = null;
-    try {
-      this.gemini.sendRealtimeInput({ media: { data: base64, mimeType: "image/png" } });
-      console.log("[relay] Canvas frame sent to Gemini");
-    } catch (err) {
-      console.warn("[relay] Canvas send failed:", err.message);
-      this.pendingCanvas = base64; // retry next time
-    }
-  }
-
   // ── Internal: message routing ─────────────────────────────────────────────
 
   _onClientMessage(raw) {
@@ -218,18 +188,6 @@ class RelaySession {
           console.warn("[relay] audio_chunk send failed:", err.message);
         }
 
-        // Opportunistically flush pending canvas
-        if (this.pendingCanvas && Date.now() - this.lastCanvasSentAt >= CANVAS_THROTTLE_MS) {
-          this._flushCanvas(this.pendingCanvas);
-        }
-        break;
-      }
-
-      case "canvas_snapshot": {
-        const dataUrl = msg.image ?? "";
-        const comma = dataUrl.indexOf(",");
-        const b64 = comma !== -1 ? dataUrl.slice(comma + 1) : dataUrl;
-        this._flushCanvas(b64);
         break;
       }
 

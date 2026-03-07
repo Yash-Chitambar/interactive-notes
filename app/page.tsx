@@ -58,15 +58,12 @@ export default function Home() {
 
   const canvasRef = useRef<CanvasHandle>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
-  const cameraVideoRef = useRef<HTMLVideoElement>(null);
-
   // Person 2: audio session
-  const { isConnected, isListening, isMuted, isSpeaking, transcript, toggleMic, toggleMute, sendCanvasSnapshot, sendTextMessage } =
+  const { isConnected, isListening, isMuted, isSpeaking, transcript, toggleMic, toggleMute, sendTextMessage } =
     useAudioSession();
 
-  // Overshoot: real-time camera vision
-  const { isActive: isCameraActive, mediaStream: cameraStream, toggleCamera } = useOvershoot({
-    subject,
+  // Overshoot: real-time screen vision (only vision layer — reads drawing, sends LaTeX to Gemini)
+  const { isActive: isCameraActive, toggleCamera } = useOvershoot({
     onResult: (text) => {
       setToast({ message: text, key: Date.now() });
       if (isConnected) sendTextMessage(text);
@@ -79,7 +76,6 @@ export default function Home() {
       subject,
       tutorMode,
       sessionId: SESSION_ID,
-      onSnapshot: sendCanvasSnapshot,
     });
 
   // --- canvas container sizing ---
@@ -122,13 +118,6 @@ export default function Home() {
     return () => window.removeEventListener("keydown", handler);
   }, [clearAnnotations]);
 
-  // --- attach camera stream to video preview element ---
-  useEffect(() => {
-    const el = cameraVideoRef.current;
-    if (!el) return;
-    el.srcObject = cameraStream;
-    if (cameraStream) el.play().catch(() => {});
-  }, [cameraStream]);
 
   // --- prevent iOS/iPad bounce scroll while drawing ---
   useEffect(() => {
@@ -401,17 +390,6 @@ export default function Home() {
             strokeWidth={strokeWidth}
             isEraser={isEraser}
           />
-
-          {/* Camera preview (Overshoot) — pip bottom-right */}
-          {isCameraActive && (
-            <video
-              ref={cameraVideoRef}
-              autoPlay
-              playsInline
-              muted
-              className="absolute bottom-3 right-3 w-32 h-24 rounded-lg object-cover border border-violet-300 shadow-lg z-20"
-            />
-          )}
 
           {/* AI annotation overlay */}
           <AIOverlay

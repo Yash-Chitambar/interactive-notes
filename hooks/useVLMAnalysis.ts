@@ -12,7 +12,6 @@ interface UseVLMAnalysisOptions {
   subject: Subject;
   tutorMode: TutorMode;
   sessionId: string;
-  onSnapshot?: (base64: string) => void; // Person 2 uses this to inject into Gemini Live
 }
 
 /** Simple djb2-style numeric hash of a string — fast, no crypto needed. */
@@ -26,7 +25,7 @@ function hashString(s: string): number {
 
 const THROTTLE_MS = 5_000; // minimum gap between API calls
 
-export function useVLMAnalysis({ subject, tutorMode, sessionId, onSnapshot }: UseVLMAnalysisOptions) {
+export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysisOptions) {
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [lastSummary, setLastSummary] = useState<string | null>(null);
@@ -56,9 +55,6 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId, onSnapshot }: Us
 
       lastCalledAt.current = now;
       lastImageHash.current = hash;
-
-      // Let Person 2's audio session know about the new snapshot
-      onSnapshot?.(image);
 
       setIsAnalyzing(true);
       try {
@@ -91,7 +87,7 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId, onSnapshot }: Us
         setIsAnalyzing(false);
       }
     },
-    [subject, tutorMode, sessionId, onSnapshot]
+    [subject, tutorMode, sessionId]
   );
 
   const clearAnnotations = useCallback(() => {

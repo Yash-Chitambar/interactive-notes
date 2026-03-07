@@ -330,11 +330,6 @@ export function useAudioSession() {
     }
   }, []);
 
-  /** Forward the current canvas frame to Gemini (throttled server-side). */
-  const sendCanvasSnapshot = useCallback((dataUrl: string) => {
-    sendWs({ type: "canvas_snapshot", image: dataUrl });
-  }, []);
-
   /** Inject a text message into the Gemini conversation. */
   const sendTextMessage = useCallback((text: string) => {
     if (text.trim()) sendWs({ type: "text", text: text.trim() });
@@ -367,7 +362,6 @@ export function useAudioSession() {
     transcript,
     toggleMic,
     toggleMute,
-    sendCanvasSnapshot,
     sendTextMessage,
     setSubject,
   };
