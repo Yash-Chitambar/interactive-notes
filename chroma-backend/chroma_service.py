@@ -159,17 +159,15 @@ class ChromaService:
             return f"[Image OCR skipped — GEMINI_API_KEY not set] {filename}"
 
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import types
 
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel("gemini-2.5-flash")
+            client = genai.Client(api_key=GEMINI_API_KEY)
 
-            image_part = {
-                "inline_data": {
-                    "data": base64.b64encode(content).decode("utf-8"),
-                    "mime_type": mime_type,
-                }
-            }
+            image_part = types.Part.from_bytes(
+                data=content,
+                mime_type=mime_type,
+            )
             prompt = (
                 "Extract all handwritten and printed text from this image exactly "
                 "as written. Return only the extracted text, nothing else."
@@ -177,7 +175,9 @@ class ChromaService:
 
             # generate_content is blocking — run in thread
             response = await asyncio.to_thread(
-                model.generate_content, [prompt, image_part]
+                client.models.generate_content,
+                model="gemini-2.5-flash",
+                contents=[prompt, image_part],
             )
             return response.text.strip()
 

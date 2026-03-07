@@ -13,8 +13,10 @@ interface AudioBarProps {
   isListening: boolean;
   isConnected: boolean;
   isMuted: boolean;
+  isCameraActive: boolean;
   onToggleMic: () => void;
   onToggleMute: () => void;
+  onToggleCamera: () => void;
 }
 
 export default function AudioBar({
@@ -22,8 +24,10 @@ export default function AudioBar({
   isListening,
   isConnected,
   isMuted,
+  isCameraActive,
   onToggleMic,
   onToggleMute,
+  onToggleCamera,
 }: AudioBarProps) {
   const lastEntry = transcript[transcript.length - 1];
 
@@ -53,6 +57,19 @@ export default function AudioBar({
         title={isMuted ? "Unmute tutor" : "Mute tutor"}
       >
         {isMuted ? "🔇" : "🔊"}
+      </button>
+
+      {/* Camera vision toggle */}
+      <button
+        onClick={onToggleCamera}
+        className={`flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center transition-colors ${
+          isCameraActive
+            ? "bg-violet-500 text-white animate-pulse"
+            : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+        }`}
+        title={isCameraActive ? "Stop camera vision" : "Start camera vision (AI watches your work)"}
+      >
+        {isCameraActive ? "📹" : "📷"}
       </button>
 
       {/* Connection status dot */}

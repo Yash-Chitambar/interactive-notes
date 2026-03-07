@@ -237,33 +237,50 @@ export function useAudioSession() {
 
   async function startMicCapture() {
     const ctx = audioCtxRef.current;
-    if (!ctx) return;
+    if (!ctx) {
+      console.error("[useAudioSession] AudioContext not available");
+      return;
+    }
+
+    console.log("[useAudioSession] AudioContext state:", ctx.state, "sampleRate:", ctx.sampleRate);
 
     // Resume suspended context (required after user gesture)
     if (ctx.state === "suspended") {
       await ctx.resume();
+      console.log("[useAudioSession] AudioContext resumed, state:", ctx.state);
     }
 
+    // Don't request sampleRate — Chrome on macOS ignores/rejects it.
+    // We resample to 16kHz manually below.
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        sampleRate: MIC_SAMPLE_RATE,
         echoCancellation: true,
         noiseSuppression: true,
       },
     });
     micStreamRef.current = stream;
+    console.log("[useAudioSession] Got mic stream, tracks:", stream.getAudioTracks().map(t => `${t.label} (${t.readyState})`));
+
+    // Stop mic cleanly if the track ends unexpectedly
+    stream.getAudioTracks().forEach(track => {
+      track.onended = () => {
+        console.warn("[useAudioSession] Mic track ended unexpectedly");
+        stopMicCapture();
+        setIsListening(false);
+      };
+    });
 
     const source = ctx.createMediaStreamSource(stream);
 
-    // Buffer size 4096 gives ~128 ms chunks at 16 kHz — reasonable for streaming.
-    // ScriptProcessorNode is deprecated but universally supported; an AudioWorklet
-    // version would be a drop-in replacement in the future.
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     scriptProcessorRef.current = processor;
 
+    let chunkCount = 0;
     processor.onaudioprocess = (e) => {
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+      chunkCount++;
+      if (chunkCount <= 3) console.log("[useAudioSession] onaudioprocess firing, chunk", chunkCount);
 
       // Get mono float32 samples from the mic
       const float32 = e.inputBuffer.getChannelData(0);

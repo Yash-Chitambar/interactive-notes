@@ -1,92 +1,106 @@
+"use strict";
+
 // ============================================================
 // ws-relay/server.js
-// Node.js WebSocket relay: browser <-> this server <-> Gemini Live
-// Uses @google/genai SDK for Gemini 2.5 Flash Live Preview
-// Run with: node ws-relay/server.js  (or: npm run ws)
+// WebSocket relay: browser <-> Gemini Live API
+//
+// Protocol (browser -> relay):
+//   { type: "audio_chunk",     data: "<base64 PCM 16kHz mono int16>" }
+//   { type: "canvas_snapshot", image: "<data URL png>" }
+//   { type: "text",            text: "..." }
+//   { type: "set_subject",     subject: "math" | "physics" | ... }
+//
+// Protocol (relay -> browser):
+//   { type: "connected" }
+//   { type: "audio",           data: "<base64 PCM 24kHz mono int16>" }
+//   { type: "transcript",      role: "tutor"|"student", text: "..." }
+//   { type: "turn_complete" }
+//   { type: "error",           message: "..." }
+//
+// Run: node ws-relay/server.js  (or: npm run ws)
 // ============================================================
-
-"use strict";
 
 const { WebSocketServer } = require("ws");
 const { GoogleGenAI, Modality } = require("@google/genai");
 
-const PORT = process.env.WS_PORT ?? 8080;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const LIVE_MODEL = "gemini-2.5-flash-native-audio-latest";
+const PORT = parseInt(process.env.WS_PORT ?? "8080", 10);
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
+const MODEL = "gemini-2.5-flash-native-audio-latest";
 
+// Minimum ms between canvas frames forwarded to Gemini
 const CANVAS_THROTTLE_MS = 10_000;
+// Delay before reconnecting a dropped Gemini session
+const GEMINI_RECONNECT_MS = 2_000;
 
 const wss = new WebSocketServer({ port: PORT });
-console.log(`[ws-relay] WebSocket server running on ws://localhost:${PORT}`);
+console.log(`[relay] Listening on ws://localhost:${PORT}`);
 
-// Track active clients so we can evict stale ones
-let activeClients = new Set();
+// Only one browser session at a time — each new connection evicts the previous.
+let activeSession = null;
 
-wss.on("connection", (clientWs) => {
-  // Close all previous connections — only one active session at a time
-  for (const old of activeClients) {
-    console.log("[ws-relay] Evicting stale client connection");
-    old.close();
+wss.on("connection", (ws) => {
+  if (activeSession) {
+    console.log("[relay] Evicting previous session");
+    activeSession.destroy();
   }
-  activeClients.clear();
-  activeClients.add(clientWs);
-  console.log("[ws-relay] Browser client connected");
+  activeSession = new RelaySession(ws);
+});
 
-  let session = null;
-  let subject = "math";
-  let lastCanvasSentAt = 0;
-  let pendingCanvasBase64 = null;
-  let closed = false;
+// ─────────────────────────────────────────────────────────────────────────────
+// RelaySession
+// Manages the lifecycle of one browser <-> Gemini connection pair.
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+class RelaySession {
+  constructor(ws) {
+    this.ws = ws;
+    this.destroyed = false;
+    this.subject = "math";
 
-  // ---- helpers ----
+    // Gemini Live session handle (null until connected)
+    this.gemini = null;
 
-  function sendToClient(obj) {
-    if (clientWs.readyState === 1 /* OPEN */) {
-      clientWs.send(JSON.stringify(obj));
+    // Canvas throttling
+    this.lastCanvasSentAt = 0;
+    this.pendingCanvas = null; // base64 PNG waiting to be sent
+
+    this.ai = GEMINI_API_KEY ? new GoogleGenAI({ apiKey: GEMINI_API_KEY }) : null;
+
+    ws.on("message", (raw) => this._onClientMessage(raw));
+    ws.on("close",   ()    => this._onClientClose());
+    ws.on("error",   (err) => console.error("[relay] client ws error:", err.message));
+
+    console.log("[relay] Browser connected");
+
+    if (this.ai) {
+      this._connectGemini();
+    } else {
+      console.warn("[relay] No GEMINI_API_KEY — running in echo mode");
     }
   }
 
-  // ---- echo mode (no API key) ----
+  // ── Public: forcibly tear down this session ────────────────────────────────
 
-  function handleEchoMode(msg) {
-    if (msg.type === "audio_chunk") {
-      sendToClient({ type: "transcript", role: "tutor", text: "[echo] Set GEMINI_API_KEY to enable voice." });
-    } else if (msg.type === "text") {
-      sendToClient({ type: "transcript", role: "tutor", text: `[echo] You said: "${msg.text}"` });
-    }
+  destroy() {
+    this.destroyed = true;
+    this._closeGemini();
+    try { this.ws.close(); } catch {}
+    if (activeSession === this) activeSession = null;
   }
 
-  // ---- canvas flush ----
+  // ── Internal: Gemini session management ───────────────────────────────────
 
-  function flushCanvas(base64Png) {
-    if (!session) { pendingCanvasBase64 = base64Png; return; }
-    const now = Date.now();
-    if (now - lastCanvasSentAt < CANVAS_THROTTLE_MS) { pendingCanvasBase64 = base64Png; return; }
-    lastCanvasSentAt = now;
-    pendingCanvasBase64 = null;
-    try {
-      session.sendRealtimeInput({ media: { data: base64Png, mimeType: "image/png" } });
-      console.log("[ws-relay] Canvas snapshot sent to Gemini");
-    } catch (e) {
-      console.warn("[ws-relay] Failed to send canvas:", e.message);
-    }
-  }
-
-  // ---- connect to Gemini Live ----
-
-  async function connectGemini() {
-    if (!ai || closed) return;
+  async _connectGemini() {
+    if (this.destroyed || !this.ai) return;
 
     const systemPrompt =
-      `You are a friendly, patient Socratic tutor helping a student with ${subject}. ` +
-      `Never give answers directly — guide with a clarifying question or a hint. ` +
+      `You are a friendly, patient Socratic tutor helping a student with ${this.subject}. ` +
+      `Never give answers directly — guide with hints and clarifying questions. ` +
       `Keep every response to two sentences or fewer.`;
 
     try {
-      session = await ai.live.connect({
-        model: LIVE_MODEL,
+      this.gemini = await this.ai.live.connect({
+        model: MODEL,
         config: {
           responseModalities: [Modality.AUDIO],
           systemInstruction: systemPrompt,
@@ -94,118 +108,186 @@ wss.on("connection", (clientWs) => {
         },
         callbacks: {
           onopen: () => {
-            console.log("[ws-relay] Gemini Live connected");
-            sendToClient({ type: "connected" });
-            if (pendingCanvasBase64) { flushCanvas(pendingCanvasBase64); }
-          },
-          onmessage: (msg) => {
-            // Audio (top-level shorthand from SDK)
-            if (msg.data) {
-              sendToClient({ type: "audio", data: msg.data, mimeType: "audio/pcm;rate=24000" });
+            console.log("[relay] Gemini Live connected");
+            this._send({ type: "connected" });
+            // Flush any canvas snapshot that arrived before the session was ready
+            if (this.pendingCanvas) {
+              this._flushCanvas(this.pendingCanvas);
             }
-            // Server content (nested parts) — skip thinking text, forward audio only
+          },
+
+          onmessage: (msg) => {
+            // Top-level audio shorthand (some SDK versions)
+            if (msg.data) {
+              this._send({ type: "audio", data: msg.data });
+            }
+
+            // Nested parts inside serverContent
             const parts = msg.serverContent?.modelTurn?.parts ?? [];
             for (const part of parts) {
               if (part.inlineData?.data) {
-                sendToClient({ type: "audio", data: part.inlineData.data, mimeType: part.inlineData.mimeType ?? "audio/pcm;rate=24000" });
+                this._send({ type: "audio", data: part.inlineData.data });
               }
             }
+
             if (msg.serverContent?.turnComplete) {
-              sendToClient({ type: "turn_complete" });
+              this._send({ type: "turn_complete" });
             }
           },
+
           onerror: (e) => {
-            console.error("[ws-relay] Gemini error:", e.message);
-            sendToClient({ type: "error", message: e.message });
+            console.error("[relay] Gemini error:", e.message);
+            this._send({ type: "error", message: e.message });
           },
+
           onclose: (e) => {
-            console.log("[ws-relay] Gemini disconnected:", e.reason ?? e.code ?? "");
-            session = null;
-            if (!closed) {
-              console.log("[ws-relay] Reconnecting in 2s...");
-              setTimeout(connectGemini, 2000);
+            console.log("[relay] Gemini disconnected:", e?.reason ?? e?.code ?? "unknown");
+            this.gemini = null;
+            if (!this.destroyed) {
+              console.log(`[relay] Reconnecting Gemini in ${GEMINI_RECONNECT_MS}ms…`);
+              setTimeout(() => this._connectGemini(), GEMINI_RECONNECT_MS);
             }
           },
         },
       });
-    } catch (e) {
-      console.error("[ws-relay] Failed to connect to Gemini:", e.message);
-      if (!closed) setTimeout(connectGemini, 3000);
+    } catch (err) {
+      console.error("[relay] Failed to open Gemini session:", err.message);
+      if (!this.destroyed) {
+        setTimeout(() => this._connectGemini(), GEMINI_RECONNECT_MS);
+      }
     }
   }
 
-  // ---- start connection ----
-  if (ai) {
-    connectGemini();
-  } else {
-    console.warn("[ws-relay] No GEMINI_API_KEY — echo mode active");
+  _closeGemini() {
+    if (this.gemini) {
+      try { this.gemini.close(); } catch {}
+      this.gemini = null;
+    }
   }
 
-  // ---- handle messages from browser ----
+  // ── Internal: canvas throttle ─────────────────────────────────────────────
 
-  clientWs.on("message", (raw) => {
+  _flushCanvas(base64) {
+    const now = Date.now();
+    if (!this.gemini || now - this.lastCanvasSentAt < CANVAS_THROTTLE_MS) {
+      this.pendingCanvas = base64;
+      return;
+    }
+    this.lastCanvasSentAt = now;
+    this.pendingCanvas = null;
+    try {
+      this.gemini.sendRealtimeInput({ media: { data: base64, mimeType: "image/png" } });
+      console.log("[relay] Canvas frame sent to Gemini");
+    } catch (err) {
+      console.warn("[relay] Canvas send failed:", err.message);
+      this.pendingCanvas = base64; // retry next time
+    }
+  }
+
+  // ── Internal: message routing ─────────────────────────────────────────────
+
+  _onClientMessage(raw) {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    if (!ai) { handleEchoMode(msg); return; }
+    if (!this.ai) {
+      this._handleEcho(msg);
+      return;
+    }
 
     switch (msg.type) {
       case "audio_chunk": {
-        if (!session) { console.warn("[ws-relay] Gemini not ready, dropping audio"); return; }
+        if (!this.gemini) {
+          // Silently drop — Gemini not ready yet
+          return;
+        }
         try {
-          session.sendRealtimeInput({ audio: { data: msg.data, mimeType: "audio/pcm;rate=16000" } });
-        } catch (e) { console.warn("[ws-relay] audio send failed:", e.message); }
+          this.gemini.sendRealtimeInput({
+            audio: { data: msg.data, mimeType: "audio/pcm;rate=16000" },
+          });
+        } catch (err) {
+          console.warn("[relay] audio_chunk send failed:", err.message);
+        }
 
-        // opportunistically flush pending canvas
-        if (pendingCanvasBase64 && Date.now() - lastCanvasSentAt >= CANVAS_THROTTLE_MS) {
-          flushCanvas(pendingCanvasBase64);
+        // Opportunistically flush pending canvas
+        if (this.pendingCanvas && Date.now() - this.lastCanvasSentAt >= CANVAS_THROTTLE_MS) {
+          this._flushCanvas(this.pendingCanvas);
         }
         break;
       }
 
       case "canvas_snapshot": {
         const dataUrl = msg.image ?? "";
-        const idx = dataUrl.indexOf(",");
-        const b64 = idx !== -1 ? dataUrl.slice(idx + 1) : dataUrl;
-        flushCanvas(b64);
+        const comma = dataUrl.indexOf(",");
+        const b64 = comma !== -1 ? dataUrl.slice(comma + 1) : dataUrl;
+        this._flushCanvas(b64);
         break;
       }
 
       case "text": {
-        if (!session) { sendToClient({ type: "error", message: "Not connected to Gemini." }); return; }
+        if (!this.gemini) {
+          this._send({ type: "error", message: "Not connected to Gemini yet." });
+          return;
+        }
+        const text = (msg.text ?? "").trim();
+        if (!text) return;
         try {
-          session.sendClientContent({ turns: [{ role: "user", parts: [{ text: msg.text }] }], turnComplete: true });
-          sendToClient({ type: "transcript", role: "student", text: msg.text });
-        } catch (e) { console.warn("[ws-relay] text send failed:", e.message); }
+          this.gemini.sendClientContent({
+            turns: [{ role: "user", parts: [{ text }] }],
+            turnComplete: true,
+          });
+          this._send({ type: "transcript", role: "student", text });
+        } catch (err) {
+          console.warn("[relay] text send failed:", err.message);
+        }
         break;
       }
 
       case "set_subject": {
-        subject = msg.subject ?? "math";
-        console.log(`[ws-relay] Subject → "${subject}", reconnecting...`);
-        if (session) {
-          try { session.close(); } catch {}
-          session = null;
-        }
-        connectGemini();
+        this.subject = msg.subject ?? "math";
+        console.log(`[relay] Subject changed to "${this.subject}" — reconnecting Gemini`);
+        this._closeGemini();
+        this._connectGemini();
         break;
       }
 
       default:
-        console.warn(`[ws-relay] Unknown message type: ${msg.type}`);
+        console.warn("[relay] Unrecognised message type:", msg.type);
     }
-  });
+  }
 
-  // ---- cleanup on browser disconnect ----
+  // ── Internal: echo mode (no API key) ─────────────────────────────────────
 
-  clientWs.on("close", () => {
-    console.log("[ws-relay] Browser client disconnected");
-    closed = true;
-    activeClients.delete(clientWs);
-    if (session) { try { session.close(); } catch {} session = null; }
-  });
+  _handleEcho(msg) {
+    if (msg.type === "audio_chunk") {
+      this._send({
+        type: "transcript",
+        role: "tutor",
+        text: "[echo] Set GEMINI_API_KEY to enable voice tutoring.",
+      });
+    } else if (msg.type === "text") {
+      this._send({
+        type: "transcript",
+        role: "tutor",
+        text: `[echo] You said: "${msg.text}"`,
+      });
+    }
+  }
 
-  clientWs.on("error", (err) => {
-    console.error("[ws-relay] Client error:", err.message);
-  });
-});
+  // ── Internal: send JSON to browser ────────────────────────────────────────
+
+  _send(obj) {
+    if (this.ws.readyState === 1 /* OPEN */) {
+      this.ws.send(JSON.stringify(obj));
+    }
+  }
+
+  // ── Internal: browser disconnected ────────────────────────────────────────
+
+  _onClientClose() {
+    console.log("[relay] Browser disconnected");
+    this.destroyed = true;
+    this._closeGemini();
+    if (activeSession === this) activeSession = null;
+  }
+}
