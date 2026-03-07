@@ -1,29 +1,26 @@
 # ============================================================
-# chroma-backend/chroma_service.py — PERSON 1 OWNS THIS FILE
+# chroma-backend/chroma_service.py
 # ChromaDB ingestion + search logic.
 # ============================================================
 
-import uuid
+import asyncio
+import base64
+import io
 import os
+import uuid
+
 import chromadb
 from chromadb.utils import embedding_functions
-import google.generativeai as genai
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-CHUNK_SIZE = 500  # characters per chunk
+CHUNK_SIZE = 500   # characters per chunk
 CHUNK_OVERLAP = 50
-
-genai.configure(api_key=GEMINI_API_KEY)
 
 
 class ChromaService:
     def __init__(self):
-        # In-process ChromaDB (no server needed)
         self.client = chromadb.PersistentClient(path="./chroma_data")
 
-        # Use Gemini embeddings
-        # TODO Person 1: switch to Gemini embedding model
-        # For now: use default sentence-transformers (no API key needed)
         self.embedding_fn = embedding_functions.DefaultEmbeddingFunction()
 
         self.collection = self.client.get_or_create_collection(
@@ -32,22 +29,39 @@ class ChromaService:
             metadata={"hnsw:space": "cosine"},
         )
 
-    async def ingest(self, content: bytes, filename: str, mime_type: str, session_id: str) -> dict:
-        """
-        OCR the file (if image/PDF), chunk the text, embed, store.
-        """
-        # --- Step 1: Extract text ---
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def ingest(
+        self,
+        content: bytes,
+        filename: str,
+        mime_type: str,
+        session_id: str,
+    ) -> dict:
+        """OCR the file (if image/PDF), chunk the text, embed, store."""
+
+        # Step 1: Extract text
         text = await self._extract_text(content, filename, mime_type)
 
-        # --- Step 2: Chunk ---
+        # Step 2: Chunk
         chunks = self._chunk(text)
 
-        # --- Step 3: Store in ChromaDB ---
+        # Step 3: Store in ChromaDB (blocking call — run in thread)
         doc_id = str(uuid.uuid4())
         ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-        metadatas = [{"source": filename, "session_id": session_id, "chunk_index": i} for i in range(len(chunks))]
+        metadatas = [
+            {
+                "source": filename,
+                "session_id": session_id,
+                "chunk_index": i,
+            }
+            for i in range(len(chunks))
+        ]
 
-        self.collection.add(
+        await asyncio.to_thread(
+            self.collection.add,
             ids=ids,
             documents=chunks,
             metadatas=metadatas,
@@ -59,61 +73,121 @@ class ChromaService:
             "source_name": filename,
         }
 
-    async def search(self, query: str, k: int = 5, session_id: str = None) -> list:
-        """
-        Semantic search, optionally filtered by session_id.
-        """
+    async def search(
+        self,
+        query: str,
+        k: int = 5,
+        session_id: str = None,
+    ) -> list:
+        """Semantic search, optionally filtered by session_id."""
+
+        # Get count in thread to avoid blocking
+        count = await asyncio.to_thread(self.collection.count)
+        if count == 0:
+            return []
+
+        n = min(k, count)
         where = {"session_id": session_id} if session_id else None
 
-        results = self.collection.query(
+        results = await asyncio.to_thread(
+            self.collection.query,
             query_texts=[query],
-            n_results=min(k, self.collection.count() or 1),
+            n_results=n,
             where=where,
         )
 
         chunks = []
-        if results["documents"]:
+        if results["documents"] and results["documents"][0]:
             for doc, meta, dist in zip(
                 results["documents"][0],
                 results["metadatas"][0],
                 results["distances"][0],
             ):
-                chunks.append({
-                    "text": doc,
-                    "source": meta.get("source", "unknown"),
-                    "relevance": 1 - dist,  # cosine similarity
-                })
+                chunks.append(
+                    {
+                        "text": doc,
+                        "source": meta.get("source", "unknown"),
+                        "relevance": round(1 - dist, 4),  # cosine similarity
+                    }
+                )
 
         return chunks
 
-    async def _extract_text(self, content: bytes, filename: str, mime_type: str) -> str:
-        """
-        Use Gemini Vision to OCR the file, or pypdf for PDFs.
-        TODO Person 1: implement full Gemini OCR pipeline.
-        """
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _extract_text(
+        self, content: bytes, filename: str, mime_type: str
+    ) -> str:
+        """Extract text from a PDF or image."""
+
         if mime_type == "application/pdf":
-            # TODO Person 1: use pypdf2 to extract text, fallback to Gemini OCR
-            import io
-            try:
-                import pypdf
-                reader = pypdf.PdfReader(io.BytesIO(content))
-                return "\n".join(page.extract_text() or "" for page in reader.pages)
-            except Exception:
-                return f"[PDF content from {filename} — OCR TODO]"
+            return await asyncio.to_thread(self._extract_pdf, content, filename)
 
-        elif mime_type.startswith("image/"):
-            # TODO Person 1: send to Gemini Vision for OCR
-            # import google.generativeai as genai
-            # model = genai.GenerativeModel("gemini-2.0-flash")
-            # img_part = {"inline_data": {"data": base64.b64encode(content).decode(), "mime_type": mime_type}}
-            # result = model.generate_content(["Extract all text from this image:", img_part])
-            # return result.text
-            return f"[Image content from {filename} — OCR TODO]"
+        if mime_type.startswith("image/"):
+            return await self._extract_image_gemini(content, filename, mime_type)
 
-        return f"[Unsupported file type: {mime_type}]"
+        # Unsupported type — use filename as placeholder so it still gets indexed
+        return f"[Unsupported file type: {mime_type}] {filename}"
+
+    # --- PDF -----------------------------------------------------------
+
+    def _extract_pdf(self, content: bytes, filename: str) -> str:
+        """Synchronous PDF extraction using pypdf."""
+        try:
+            import pypdf
+
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            pages = []
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                pages.append(page_text)
+            text = "\n".join(pages).strip()
+            return text if text else f"[No extractable text in PDF: {filename}]"
+        except Exception as exc:
+            return f"[PDF extraction failed for {filename}: {exc}]"
+
+    # --- Image / Gemini Vision ----------------------------------------
+
+    async def _extract_image_gemini(
+        self, content: bytes, filename: str, mime_type: str
+    ) -> str:
+        """Use Gemini Vision to OCR an image."""
+
+        if not GEMINI_API_KEY:
+            return f"[Image OCR skipped — GEMINI_API_KEY not set] {filename}"
+
+        try:
+            import google.generativeai as genai
+
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+
+            image_part = {
+                "inline_data": {
+                    "data": base64.b64encode(content).decode("utf-8"),
+                    "mime_type": mime_type,
+                }
+            }
+            prompt = (
+                "Extract all handwritten and printed text from this image exactly "
+                "as written. Return only the extracted text, nothing else."
+            )
+
+            # generate_content is blocking — run in thread
+            response = await asyncio.to_thread(
+                model.generate_content, [prompt, image_part]
+            )
+            return response.text.strip()
+
+        except Exception as exc:
+            return f"[Gemini OCR failed for {filename}: {exc}]"
+
+    # --- Chunking ------------------------------------------------------
 
     def _chunk(self, text: str) -> list[str]:
-        """Split text into overlapping chunks."""
+        """Split text into overlapping chunks of CHUNK_SIZE characters."""
         if not text.strip():
             return ["(empty document)"]
 
@@ -121,7 +195,9 @@ class ChromaService:
         start = 0
         while start < len(text):
             end = start + CHUNK_SIZE
-            chunks.append(text[start:end].strip())
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
             start += CHUNK_SIZE - CHUNK_OVERLAP
 
-        return [c for c in chunks if c]
+        return chunks if chunks else ["(empty document)"]

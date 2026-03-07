@@ -12,14 +12,18 @@ interface AudioBarProps {
   transcript: TranscriptEntry[];
   isListening: boolean;
   isConnected: boolean;
+  isMuted: boolean;
   onToggleMic: () => void;
+  onToggleMute: () => void;
 }
 
 export default function AudioBar({
   transcript,
   isListening,
   isConnected,
+  isMuted,
   onToggleMic,
+  onToggleMute,
 }: AudioBarProps) {
   const lastEntry = transcript[transcript.length - 1];
 
@@ -36,6 +40,19 @@ export default function AudioBar({
         title={isListening ? "Stop listening" : "Start listening"}
       >
         {isListening ? "🔴" : "🎤"}
+      </button>
+
+      {/* Mute button */}
+      <button
+        onClick={onToggleMute}
+        className={`flex-shrink-0 w-9 h-9 rounded-full flex items-center justify-center transition-colors ${
+          isMuted
+            ? "bg-amber-100 text-amber-600 hover:bg-amber-200"
+            : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+        }`}
+        title={isMuted ? "Unmute tutor" : "Mute tutor"}
+      >
+        {isMuted ? "🔇" : "🔊"}
       </button>
 
       {/* Connection status dot */}
