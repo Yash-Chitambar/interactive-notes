@@ -22,6 +22,8 @@ export interface AnalyzeRequest {
   subject: Subject;
   session_id: string;
   tutor_mode: TutorMode;
+  /** Optional: user drew a box and asked about this region */
+  question?: string;
 }
 
 // --- ChromaDB / Notes (Person 1) ---
