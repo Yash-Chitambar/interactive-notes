@@ -52,6 +52,10 @@ export default function Home() {
   const [askRect, setAskRect] = useState<AskRect | null>(null);
   const [askDraft, setAskDraft] = useState("");
   const [isAskSubmitting, setIsAskSubmitting] = useState(false);
+  const [showVisualizeModal, setShowVisualizeModal] = useState(false);
+  const [visualizePrompt, setVisualizePrompt] = useState("");
+  const [visualizeImage, setVisualizeImage] = useState<string | null>(null);
+  const [isVisualizeLoading, setIsVisualizeLoading] = useState(false);
 
   // Actual canvas pixel dimensions
   const [canvasSize, setCanvasSize] = useState({ width: 1200, height: 900 });
@@ -339,6 +343,43 @@ export default function Home() {
     sendTextMessage,
   ]);
 
+  const handleVisualizeOpen = useCallback(() => {
+    setShowVisualizeModal(true);
+    setVisualizePrompt("");
+    setVisualizeImage(null);
+  }, []);
+
+  const handleVisualizeClose = useCallback(() => {
+    setShowVisualizeModal(false);
+    setVisualizePrompt("");
+    setVisualizeImage(null);
+  }, []);
+
+  const handleVisualizeSubmit = useCallback(async () => {
+    const prompt = visualizePrompt.trim();
+    if (!prompt) return;
+    setIsVisualizeLoading(true);
+    setVisualizeImage(null);
+    try {
+      const res = await fetch("/api/visualize", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setToast({ message: data.error ?? "Image generation failed", key: Date.now() });
+        return;
+      }
+      if (data.image) setVisualizeImage(data.image);
+    } catch (err) {
+      console.error("Visualize error:", err);
+      setToast({ message: "Something went wrong. Try again.", key: Date.now() });
+    } finally {
+      setIsVisualizeLoading(false);
+    }
+  }, [visualizePrompt]);
+
   return (
     <div
       className="flex flex-col bg-gray-50"
@@ -517,6 +558,29 @@ export default function Home() {
             />
           </svg>
           Ask
+        </button>
+
+        {/* Visualize: generate an image of a math concept via Imagen 3 */}
+        <button
+          type="button"
+          onClick={handleVisualizeOpen}
+          title="Generate an image of a concept (e.g. math) using AI"
+          className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md border border-gray-200 bg-white text-gray-600 hover:border-amber-300 hover:bg-amber-50/50 transition-colors flex-shrink-0"
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-3.5 w-3.5"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path
+              fillRule="evenodd"
+              d="M1 5.25A2.25 2.25 0 013.25 3h13.5A2.25 2.25 0 0119 5.25v9.5A2.25 2.25 0 0116.75 17H3.25A2.25 2.25 0 011 14.75v-9.5zm1.5 5.81v3.69c0 .414.336.75.75.75h13.5a.75.75 0 00.75-.75v-3.69a.75.75 0 00-.22-.53L11.47 4.72a.75.75 0 00-1.06 0L2.72 10.53a.75.75 0 00-.22.53z"
+              clipRule="evenodd"
+            />
+          </svg>
+          Visualize
         </button>
 
         {/* Clear canvas */}
@@ -705,6 +769,85 @@ export default function Home() {
           type="info"
           onDismiss={() => setToast(null)}
         />
+      )}
+
+      {/* ── Visualize modal: prompt + generated image ── */}
+      {showVisualizeModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          onClick={(e) => e.target === e.currentTarget && handleVisualizeClose()}
+        >
+          <div
+            className="bg-white rounded-xl shadow-xl max-w-md w-full max-h-[90vh] overflow-auto flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="p-4 border-b border-gray-100">
+              <h2 className="text-lg font-semibold text-gray-800">Visualize</h2>
+              <p className="text-sm text-gray-500 mt-0.5">What do you want to visualize?</p>
+              <p className="text-xs text-gray-400 mt-1">e.g. &quot;parabola y = x²&quot;, &quot;unit circle&quot;, &quot;Pythagorean theorem diagram&quot;</p>
+            </div>
+            <div className="p-4 space-y-3">
+              <input
+                type="text"
+                value={visualizePrompt}
+                onChange={(e) => setVisualizePrompt(e.target.value)}
+                placeholder="Enter a math concept or idea…"
+                className="w-full text-sm border border-gray-200 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400"
+                onKeyDown={(e) => e.key === "Enter" && handleVisualizeSubmit()}
+              />
+              {visualizeImage ? (
+                <div className="space-y-2">
+                  <img
+                    src={visualizeImage}
+                    alt="Generated visualization"
+                    className="w-full rounded-lg border border-gray-200 max-h-80 object-contain bg-gray-50"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => { setVisualizeImage(null); setVisualizePrompt(""); }}
+                    className="text-xs text-gray-500 hover:text-gray-700"
+                  >
+                    Generate another
+                  </button>
+                </div>
+              ) : isVisualizeLoading ? (
+                <div className="flex items-center justify-center py-12 gap-2 text-amber-600">
+                  <svg
+                    className="animate-spin h-5 w-5"
+                    xmlns="http://www.w3.org/2000/svg"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                  >
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+                  </svg>
+                  <span>Generating image…</span>
+                </div>
+              ) : null}
+            </div>
+            <div className="p-4 border-t border-gray-100 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={handleVisualizeClose}
+                className="px-3 py-1.5 text-sm rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-50"
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                onClick={handleVisualizeSubmit}
+                disabled={!visualizePrompt.trim() || isVisualizeLoading}
+                className={`px-4 py-1.5 text-sm rounded-lg text-white ${
+                  visualizePrompt.trim() && !isVisualizeLoading
+                    ? "bg-amber-500 hover:bg-amber-600"
+                    : "bg-amber-300 cursor-not-allowed"
+                }`}
+              >
+                {isVisualizeLoading ? "Generating…" : "Generate"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
