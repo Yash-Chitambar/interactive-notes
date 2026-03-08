@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@browserbasehq/sdk": "^2.7.0",
+    "@browserbasehq/stagehand": "^3.1.0",
     "@chroma-core/chroma-cloud-qwen": "^0.1.10",
     "@chroma-core/chroma-cloud-splade": "^0.1.10",
     "@chroma-core/default-embed": "^0.1.9",
@@ -19,11 +20,14 @@
     "chromadb": "^3.3.1",
     "next": "15.1.6",
     "overshoot": "^2.0.0-alpha.7",
+    "pdf-parse": "^2.4.5",
     "pdfjs-dist": "^5.5.207",
     "puppeteer-core": "^24.38.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "uuid": "^11.0.0"
+    "unpdf": "^1.4.0",
+    "uuid": "^11.0.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^20",
