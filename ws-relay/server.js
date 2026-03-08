@@ -24,7 +24,7 @@ const { GoogleGenAI, Modality } = require("@google/genai");
 
 const PORT = parseInt(process.env.WS_PORT ?? "8080", 10);
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY ?? "";
-const MODEL = "gemini-2.5-flash-native-audio-latest";
+const MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 
 // Delay before reconnecting a dropped Gemini session
 const GEMINI_RECONNECT_MS = 2_000;
@@ -89,6 +89,8 @@ class RelaySession {
     const systemPrompt =
       `You are a friendly, patient Socratic tutor helping a student with ${this.subject}. ` +
       `Never give answers directly — guide with hints and clarifying questions. ` +
+      `You will periodically receive images of the student's canvas as they write. ` +
+      `Use these images for visual context when responding. ` +
       `Keep every response to two sentences or fewer.`;
 
     try {
@@ -215,6 +217,20 @@ class RelaySession {
         console.log(`[relay] Subject changed to "${this.subject}" — reconnecting Gemini`);
         this._closeGemini();
         this._connectGemini();
+        break;
+      }
+
+      case "canvas_frame": {
+        if (!this.gemini) return; // silently drop — Gemini not ready
+        const data = (msg.data ?? "").replace(/^data:image\/\w+;base64,/, "");
+        if (!data) return;
+        try {
+          this.gemini.sendRealtimeInput({
+            video: { data, mimeType: "image/png" },
+          });
+        } catch (err) {
+          console.warn("[relay] canvas_frame send failed:", err.message);
+        }
         break;
       }
 

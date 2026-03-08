@@ -65,17 +65,13 @@ export default function Home() {
   const canvasRef = useRef<CanvasHandle>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
   const askDragRef = useRef<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
+  const lastSpokenAt = useRef<number>(0);
   // Person 2: audio session
   const { isConnected, isListening, isMuted, isSpeaking, transcript, toggleMic, toggleMute, sendTextMessage } =
     useAudioSession();
 
-  // Overshoot: real-time screen vision (only vision layer — reads drawing, sends LaTeX to Gemini)
-  const { isActive: isCameraActive, toggleCamera } = useOvershoot({
-    onResult: (text) => {
-      setToast({ message: text, key: Date.now() });
-      if (isConnected) sendTextMessage(text);
-    },
-  });
+  // Overshoot: buffers latest screen text; consumed on stroke-end
+  const { isActive: isCameraActive, toggleCamera, getLatestText } = useOvershoot();
 
   // Person 3: VLM analysis
   const { annotations, isAnalyzing, lastSummary, analyze, clearAnnotations, applyResult } =
@@ -108,11 +104,16 @@ export default function Home() {
     return () => observer.disconnect();
   }, []);
 
-  // --- show toast + speak summary when VLM returns feedback ---
+  // --- show toast; speak summary only when there's an error/hint and 30s have passed ---
   useEffect(() => {
-    if (lastSummary && lastSummary.trim() !== "") {
-      setToast({ message: lastSummary, key: Date.now() });
-      if (isConnected) sendTextMessage(lastSummary);
+    if (!lastSummary || lastSummary.trim() === "") return;
+    setToast({ message: lastSummary, key: Date.now() });
+
+    const hasIssue = annotations.some((a) => a.type === "error" || a.type === "hint");
+    const now = Date.now();
+    if (hasIssue && isConnected && !isSpeaking && now - lastSpokenAt.current > 30_000) {
+      lastSpokenAt.current = now;
+      sendTextMessage(lastSummary);
     }
   }, [lastSummary]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -135,10 +136,14 @@ export default function Home() {
 
   // --- stroke end handler ---
   const handleStrokeEnd = useCallback(() => {
+    if (isSpeaking) return;
+    if (!canvasRef.current?.hasStrokes()) return;
+
     if (canvasRef.current) {
-      analyze(canvasRef.current.getSnapshot);
+      const overshootText = isCameraActive ? getLatestText() : undefined;
+      analyze(canvasRef.current.getSnapshot, overshootText);
     }
-  }, [analyze]);
+  }, [analyze, isSpeaking, isCameraActive, getLatestText]);
 
   // --- per-annotation dismiss ---
   const handleDismissAnnotation = useCallback(
@@ -156,7 +161,8 @@ export default function Home() {
   // --- toolbar helpers ---
   const handleClearCanvas = useCallback(() => {
     canvasRef.current?.clear();
-  }, []);
+    clearAnnotations();
+  }, [clearAnnotations]);
 
   const handleClearAI = useCallback(() => {
     clearAnnotations();

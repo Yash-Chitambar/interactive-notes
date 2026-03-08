@@ -24,6 +24,7 @@ export interface AnalyzeRequest {
   tutor_mode: TutorMode;
   /** Optional: user drew a box and asked about this region */
   question?: string;
+  overshoot_text?: string;  // LaTeX/text extracted by Overshoot screen capture
 }
 
 // --- ChromaDB / Notes (Person 1) ---

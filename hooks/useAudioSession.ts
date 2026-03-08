@@ -335,6 +335,12 @@ export function useAudioSession() {
     if (text.trim()) sendWs({ type: "text", text: text.trim() });
   }, []);
 
+  /** Send a canvas PNG snapshot to Gemini Live for visual context. */
+  const sendCanvasFrame = useCallback((base64: string) => {
+    const data = base64.includes(",") ? base64.split(",")[1] : base64;
+    if (data) sendWs({ type: "canvas_frame", data });
+  }, []);
+
   /** Change the active subject — causes the relay to reconnect Gemini with a new system prompt. */
   const setSubject = useCallback((subject: string) => {
     sendWs({ type: "set_subject", subject });
@@ -363,6 +369,7 @@ export function useAudioSession() {
     toggleMic,
     toggleMute,
     sendTextMessage,
+    sendCanvasFrame,
     setSubject,
   };
 }

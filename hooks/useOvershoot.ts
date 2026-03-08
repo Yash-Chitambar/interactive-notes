@@ -3,36 +3,28 @@
 // ============================================================
 // hooks/useOvershoot.ts
 // Real-time screen vision using Overshoot SDK.
-// Reads the student's handwritten drawing from the screen,
-// converts equations to LaTeX, and sends the extracted text
-// to Gemini for reasoning. This is the only vision layer.
+// Runs continuously while active, buffering the latest LaTeX
+// extraction into a ref. Stroke-end reads the buffer on demand.
 // ============================================================
 
 import { useState, useRef, useCallback, useEffect } from "react";
 
-// Dynamic import so the SSR build doesn't choke on browser APIs.
 type RealtimeVisionType = import("overshoot").RealtimeVision;
 
-const OVERSHOOT_API_KEY =
-  process.env.NEXT_PUBLIC_OVERSHOOT_API_KEY ?? "";
-
-const OVERSHOOT_MODEL = "Qwen/Qwen3.5-9B";
-const OVERSHOOT_PROMPT =
+const OVERSHOOT_API_KEY = process.env.NEXT_PUBLIC_OVERSHOOT_API_KEY ?? "";
+const OVERSHOOT_MODEL   = "Qwen/Qwen3.5-9B";
+const OVERSHOOT_PROMPT  =
   "Read all the handwritten text, convert equations to latex, and ignore everything else";
 
-interface UseOvershootOptions {
-  onResult: (text: string) => void;
-}
-
-export function useOvershoot({ onResult }: UseOvershootOptions) {
+export function useOvershoot() {
   const [isActive, setIsActive] = useState(false);
-  const [lastResult, setLastResult] = useState<string>("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError]       = useState<string | null>(null);
 
-  const visionRef = useRef<RealtimeVisionType | null>(null);
-  const onResultRef = useRef(onResult);
+  const visionRef     = useRef<RealtimeVisionType | null>(null);
+  const latestTextRef = useRef<string>("");
 
-  useEffect(() => { onResultRef.current = onResult; }, [onResult]);
+  /** Returns the most recent Overshoot extraction (may be empty string). */
+  const getLatestText = useCallback(() => latestTextRef.current, []);
 
   const startCamera = useCallback(async () => {
     if (!OVERSHOOT_API_KEY) {
@@ -53,14 +45,11 @@ export function useOvershoot({ onResult }: UseOvershootOptions) {
         model: OVERSHOOT_MODEL,
         source: { type: "screen" },
         mode: "frame",
-        frameProcessing: { interval_seconds: 0.5 },
+        // 2s interval — we only consume on stroke-end, fast polling is wasteful
+        frameProcessing: { interval_seconds: 2 },
         onResult: (r) => {
           if (r.ok && r.result) {
-            const text = r.result.trim();
-            if (text) {
-              setLastResult(text);
-              onResultRef.current(text);
-            }
+            latestTextRef.current = r.result.trim();
           }
         },
         onError: (err) => {
@@ -84,7 +73,8 @@ export function useOvershoot({ onResult }: UseOvershootOptions) {
   const stopCamera = useCallback(async () => {
     if (!visionRef.current) return;
     await visionRef.current.stop();
-    visionRef.current = null;
+    visionRef.current     = null;
+    latestTextRef.current = "";
     setIsActive(false);
   }, []);
 
@@ -96,12 +86,11 @@ export function useOvershoot({ onResult }: UseOvershootOptions) {
     }
   }, [isActive, startCamera, stopCamera]);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       visionRef.current?.stop().catch(() => {});
     };
   }, []);
 
-  return { isActive, lastResult, error, toggleCamera, startCamera, stopCamera };
+  return { isActive, error, toggleCamera, getLatestText };
 }

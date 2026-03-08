@@ -23,14 +23,11 @@ function hashString(s: string): number {
   return h;
 }
 
-const THROTTLE_MS = 5_000; // minimum gap between API calls
-
 export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysisOptions) {
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [lastSummary, setLastSummary] = useState<string | null>(null);
 
-  const lastCalledAt = useRef<number>(0);
   const lastImageHash = useRef<number | null>(null);
   const abortCtrlRef = useRef<AbortController | null>(null);
 
@@ -40,12 +37,7 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
   }, []);
 
   const analyze = useCallback(
-    async (getSnapshot: () => string) => {
-      const now = Date.now();
-
-      // Throttle: don't call within THROTTLE_MS of the last call
-      if (now - lastCalledAt.current < THROTTLE_MS) return;
-
+    async (getSnapshot: () => string, overshootText?: string) => {
       const image = getSnapshot();
       if (!image || image === "data:," || image === "") return;
 
@@ -58,7 +50,6 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
       const ctrl = new AbortController();
       abortCtrlRef.current = ctrl;
 
-      lastCalledAt.current = now;
       lastImageHash.current = hash;
 
       setIsAnalyzing(true);
@@ -68,6 +59,7 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
           subject,
           session_id: sessionId,
           tutor_mode: tutorMode,
+          overshoot_text: overshootText,
         };
 
         const res = await fetch("/api/analyze", {
@@ -80,7 +72,12 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
         if (!res.ok) throw new Error(`analyze failed: ${res.status}`);
 
         const data: AnnotationResponse = await res.json();
-        applyResult(data);
+        // Only surface errors and significant hints — drop praise and minor hints
+        const filtered = (data.annotations ?? []).filter(
+          (a) => a.type === "error" || (a.type === "hint" && a.severity >= 2)
+        );
+        setAnnotations(filtered);
+        setLastSummary(filtered.length > 0 ? (data.summary ?? null) : null);
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
           // Request was intentionally cancelled — not an error

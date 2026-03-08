@@ -17,6 +17,7 @@ import {
 export interface CanvasHandle {
   getSnapshot: () => string; // returns base64 PNG data URL
   clear: () => void;
+  hasStrokes: () => boolean; // true if student has drawn anything
 }
 
 interface Point {
@@ -227,6 +228,7 @@ const Canvas = forwardRef<CanvasHandle, CanvasProps>(
     // --- imperative handle ---
 
     useImperativeHandle(ref, () => ({
+      hasStrokes: () => pathHistory.current.length > 0,
       getSnapshot: () => {
         const canvas = canvasRef.current;
         if (!canvas) return "";

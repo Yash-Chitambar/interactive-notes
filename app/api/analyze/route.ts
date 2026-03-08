@@ -53,7 +53,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { image, subject, session_id, tutor_mode, question } = body;
+  const { image, subject, session_id, tutor_mode, question, overshoot_text } = body;
   if (!image) {
     return NextResponse.json({ error: "image is required" }, { status: 400 });
   }
@@ -80,7 +80,7 @@ export async function POST(req: NextRequest) {
   try {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({
-      model: "gemini-2.5-flash",
+      model: "gemini-3.1-flash-lite-preview",
       generationConfig: {
         responseMimeType: "application/json",
         responseSchema: ANNOTATION_SCHEMA,
@@ -90,7 +90,7 @@ export async function POST(req: NextRequest) {
     });
 
     const result = await model.generateContent([
-      { text: buildPrompt(subject, contextText, tutor_mode, question) },
+      { text: buildPrompt(subject, contextText, tutor_mode, question, overshoot_text) },
       { inlineData: { data: base64Data, mimeType: "image/png" } },
     ]);
 
@@ -129,7 +129,7 @@ export async function POST(req: NextRequest) {
 
 // ── Prompt ────────────────────────────────────────────────────────────────
 
-function buildPrompt(subject: string, context: string, mode: string, question?: string): string {
+function buildPrompt(subject: string, context: string, mode: string, question?: string, overshootText?: string): string {
   const guides: Record<string, string> = {
     math:      "Look for arithmetic errors, wrong signs, incorrect algebra, missing simplification.",
     physics:   "Look for wrong formulas, unit errors, incorrect vector directions, sign mistakes.",
@@ -145,7 +145,7 @@ function buildPrompt(subject: string, context: string, mode: string, question?: 
 
   return `You are a patient, encouraging ${subject} tutor reviewing a student's handwritten work on a digital canvas.
 
-${context ? `Student's uploaded notes for context:\n${context}\n\n` : ""}${guide}
+${context ? `Student's uploaded notes for context:\n${context}\n\n` : ""}${overshootText ? `Handwritten content extracted from canvas (use for understanding; bounding boxes must reference the image):\n${overshootText}\n\n` : ""}${guide}
 ${questionBlock}
 Tutor mode: "${mode}"
 ${mode === "hint"
