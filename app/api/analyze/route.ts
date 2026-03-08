@@ -8,8 +8,65 @@ import { NextRequest, NextResponse } from "next/server";
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import type { Schema } from "@google/generative-ai";
 import { AnalyzeRequest, AnnotationResponse } from "@/types";
+import { CloudClient, Collection } from "chromadb";
+import { ChromaCloudQwenEmbeddingFunction, ChromaCloudQwenEmbeddingModel } from "@chroma-core/chroma-cloud-qwen";
+import { ChromaCloudSpladeEmbeddingFunction, ChromaCloudSpladeEmbeddingModel } from "@chroma-core/chroma-cloud-splade";
 
 const CHROMA_BACKEND = process.env.CHROMA_BACKEND_URL ?? "http://localhost:8001";
+
+async function ragSearch(userPrompt: string) {
+
+  const client = new CloudClient(
+    {
+      tenant: process.env.CHROMA_TENANT ?? "",
+      database: process.env.CHROMA_DATABASE ?? "",
+      apiKey: process.env.CHROME_API_KEY ?? "",
+    }
+  );
+
+  const qwenEf = new ChromaCloudQwenEmbeddingFunction({
+    model: ChromaCloudQwenEmbeddingModel.QWEN3_EMBEDDING_0p6B,
+    task: null,
+    apiKeyEnvVar: "CHROMA_API_KEY",  // name of your env var, not the value itself
+  });
+
+  const spladeEf = new ChromaCloudSpladeEmbeddingFunction({
+    model: ChromaCloudSpladeEmbeddingModel.SPLADE_PP_EN_V1,
+    apiKeyEnvVar: "CHROMA_API_KEY",  // name of your env var, not the value itself
+  });
+
+  // Step 1: Retrieve relevant chunks from ChromaDB
+  const collection = await client.getCollection({ 
+    name: "notes_general-data",
+    embeddingFunction: qwenEf
+  });
+  const { docs, metas } = await hybridSearch(collection, userPrompt);
+
+  return buildContext(docs)
+}
+
+function buildContext(docs: string[]): string {
+  return docs
+    .map((doc, i) => `[Source ${i + 1}]:\n${doc}`)
+    .join("\n\n---\n\n");
+}
+
+async function hybridSearch(
+  collection: Collection,
+  query: string,
+  nResults: number = 5
+): Promise<{ docs: string[]; metas: Record<string, any>[] }> {
+  const results = await collection.query({
+    queryTexts: [query],
+    nResults,
+    include: ["documents", "metadatas", "distances"],
+  });
+
+  const docs = results.documents[0] as string[];
+  const metas = results.metadatas[0] as Record<string, any>[];
+
+  return { docs, metas };
+}
 
 // Enforce structured JSON output — no parsing guesswork
 const ANNOTATION_SCHEMA: Schema = {
@@ -78,6 +135,8 @@ export async function POST(req: NextRequest) {
 
   // ── Step 2: Call Gemini 2.0 Flash Vision ─────────────────────────────
   try {
+    const RAG_supplement_text = await ragSearch(subject);
+
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({
       model: "gemini-2.5-flash",
@@ -90,7 +149,7 @@ export async function POST(req: NextRequest) {
     });
 
     const result = await model.generateContent([
-      { text: buildPrompt(subject, contextText, tutor_mode, question) },
+      { text: buildPrompt(subject, contextText, tutor_mode, RAG_supplement_text) },
       { inlineData: { data: base64Data, mimeType: "image/png" } },
     ]);
 
@@ -129,7 +188,7 @@ export async function POST(req: NextRequest) {
 
 // ── Prompt ────────────────────────────────────────────────────────────────
 
-function buildPrompt(subject: string, context: string, mode: string, question?: string): string {
+function buildPrompt(subject: string, context: string, mode: string, RAGResponse: string): string {
   const guides: Record<string, string> = {
     math:      "Look for arithmetic errors, wrong signs, incorrect algebra, missing simplification.",
     physics:   "Look for wrong formulas, unit errors, incorrect vector directions, sign mistakes.",
@@ -138,15 +197,9 @@ function buildPrompt(subject: string, context: string, mode: string, question?: 
   };
   const guide = guides[subject] ?? "Look for factual or logical errors.";
 
-  const questionBlock =
-    question && question.trim().length > 0
-      ? `\nThe student selected a region and asked:\n"${question.trim()}"\nAnswer or annotate with that question in mind. Coordinates in the image are relative to the cropped region.\n`
-      : "";
-
   return `You are a patient, encouraging ${subject} tutor reviewing a student's handwritten work on a digital canvas.
 
 ${context ? `Student's uploaded notes for context:\n${context}\n\n` : ""}${guide}
-${questionBlock}
 Tutor mode: "${mode}"
 ${mode === "hint"
   ? "NEVER reveal the correct answer — point to where the error is and ask a guiding question."
@@ -160,5 +213,9 @@ Rules:
 - text: max 60 chars, specific ("Wrong sign here", "Check exponent", "x = -1 not +1")
 - If canvas is blank or nearly empty: return annotations=[], summary="Go ahead — start writing!"
 - Only annotate what you can clearly see — ignore illegible marks
-- summary: one short, encouraging sentence (or direct answer to the student's question if they asked one)`;
+- summary: one short, encouraging sentence spoken aloud to the student
+
+RAG from relevant database (additional context):
+${RAGResponse}
+`;
 }
