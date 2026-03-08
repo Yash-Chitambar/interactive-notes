@@ -34,6 +34,11 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
   const lastImageHash = useRef<number | null>(null);
   const abortCtrlRef = useRef<AbortController | null>(null);
 
+  const applyResult = useCallback((data: AnnotationResponse) => {
+    setAnnotations(data.annotations ?? []);
+    setLastSummary(data.summary ?? null);
+  }, []);
+
   const analyze = useCallback(
     async (getSnapshot: () => string) => {
       const now = Date.now();
@@ -75,8 +80,7 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
         if (!res.ok) throw new Error(`analyze failed: ${res.status}`);
 
         const data: AnnotationResponse = await res.json();
-        setAnnotations(data.annotations ?? []);
-        setLastSummary(data.summary ?? null);
+        applyResult(data);
       } catch (err) {
         if (err instanceof Error && err.name === "AbortError") {
           // Request was intentionally cancelled — not an error
@@ -87,7 +91,7 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
         setIsAnalyzing(false);
       }
     },
-    [subject, tutorMode, sessionId]
+    [subject, tutorMode, sessionId, applyResult]
   );
 
   const clearAnnotations = useCallback(() => {
@@ -95,5 +99,5 @@ export function useVLMAnalysis({ subject, tutorMode, sessionId }: UseVLMAnalysis
     setLastSummary(null);
   }, []);
 
-  return { annotations, isAnalyzing, lastSummary, analyze, clearAnnotations };
+  return { annotations, isAnalyzing, lastSummary, analyze, clearAnnotations, applyResult };
 }

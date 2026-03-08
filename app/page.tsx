@@ -23,7 +23,7 @@ import SubjectSelector from "@/components/SubjectSelector";
 import { useVLMAnalysis } from "@/hooks/useVLMAnalysis";
 import { useAudioSession } from "@/hooks/useAudioSession";
 import { useOvershoot } from "@/hooks/useOvershoot";
-import { Annotation, Subject } from "@/types";
+import { Annotation, AnnotationResponse, Subject } from "@/types";
 import Link from "next/link";
 
 const SESSION_ID = uuidv4(); // one session per page load
@@ -38,6 +38,8 @@ const PEN_COLORS = [
 
 type PenColor = (typeof PEN_COLORS)[number]["value"];
 
+type AskRect = { x: number; y: number; w: number; h: number };
+
 export default function Home() {
   const [subject, setSubject] = useState<Subject>("math");
   const [tutorMode] = useState<"hint" | "answer">("hint");
@@ -46,8 +48,12 @@ export default function Home() {
   const [penColor, setPenColor] = useState<PenColor>("#1a1a1a");
   const [strokeWidth, setStrokeWidth] = useState(2.5);
   const [isEraser, setIsEraser] = useState(false);
+  const [isAskMode, setIsAskMode] = useState(false);
+  const [askRect, setAskRect] = useState<AskRect | null>(null);
+  const [askDraft, setAskDraft] = useState("");
+  const [isAskSubmitting, setIsAskSubmitting] = useState(false);
 
-  // Actual canvas pixel dimensions (updated by ResizeObserver on the container)
+  // Actual canvas pixel dimensions
   const [canvasSize, setCanvasSize] = useState({ width: 1200, height: 900 });
 
   // Toast state
@@ -58,6 +64,7 @@ export default function Home() {
 
   const canvasRef = useRef<CanvasHandle>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
+  const askDragRef = useRef<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
   // Person 2: audio session
   const { isConnected, isListening, isMuted, isSpeaking, transcript, toggleMic, toggleMute, sendTextMessage } =
     useAudioSession();
@@ -71,7 +78,7 @@ export default function Home() {
   });
 
   // Person 3: VLM analysis
-  const { annotations, isAnalyzing, lastSummary, analyze, clearAnnotations } =
+  const { annotations, isAnalyzing, lastSummary, analyze, clearAnnotations, applyResult } =
     useVLMAnalysis({
       subject,
       tutorMode,
@@ -161,8 +168,170 @@ export default function Home() {
 
   const handlePenColorSelect = useCallback((color: PenColor) => {
     setPenColor(color);
-    setIsEraser(false); // selecting a color exits eraser mode
+    setIsEraser(false);
   }, []);
+
+  const handleAskToggle = useCallback(() => {
+    setIsAskMode((prev) => {
+      const next = !prev;
+      if (!next) {
+        setAskRect(null);
+        setAskDraft("");
+        askDragRef.current = null;
+      }
+      return next;
+    });
+    setIsEraser(false);
+  }, []);
+
+  const getCanvasPos = useCallback((clientX: number, clientY: number) => {
+    const container = canvasContainerRef.current;
+    if (!container) return null;
+    const rect = container.getBoundingClientRect();
+    return {
+      x: Math.min(Math.max(clientX - rect.left, 0), rect.width),
+      y: Math.min(Math.max(clientY - rect.top, 0), rect.height),
+    };
+  }, []);
+
+  const handleAskPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!isAskMode) return;
+      const target = e.target as HTMLElement;
+      if (target.closest("[data-ask-ui]")) return;
+      e.preventDefault();
+      const pos = getCanvasPos(e.clientX, e.clientY);
+      if (!pos) return;
+      askDragRef.current = { startX: pos.x, startY: pos.y, currentX: pos.x, currentY: pos.y };
+      setAskRect({ x: pos.x, y: pos.y, w: 0, h: 0 });
+      setAskDraft("");
+    },
+    [isAskMode, getCanvasPos]
+  );
+
+  const handleAskPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!isAskMode || !askDragRef.current) return;
+      e.preventDefault();
+      const pos = getCanvasPos(e.clientX, e.clientY);
+      if (!pos) return;
+      askDragRef.current.currentX = pos.x;
+      askDragRef.current.currentY = pos.y;
+      const { startX, startY, currentX, currentY } = askDragRef.current;
+      setAskRect({
+        x: Math.min(startX, currentX),
+        y: Math.min(startY, currentY),
+        w: Math.abs(currentX - startX),
+        h: Math.abs(currentY - startY),
+      });
+    },
+    [isAskMode, getCanvasPos]
+  );
+
+  const handleAskPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!isAskMode || !askDragRef.current || !askRect) return;
+      e.preventDefault();
+      askDragRef.current = null;
+      const MIN = 10;
+      if (askRect.w < MIN || askRect.h < MIN) setAskRect(null);
+    },
+    [isAskMode, askRect]
+  );
+
+  const cropSnapshotToRect = useCallback(
+    async (rect: AskRect): Promise<string | null> => {
+      if (!canvasRef.current) return null;
+      const snapshot = canvasRef.current.getSnapshot();
+      if (!snapshot) return null;
+      const img = new Image();
+      img.src = snapshot;
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error("Failed to load canvas snapshot"));
+      });
+      const scaleX = img.width / canvasSize.width;
+      const scaleY = img.height / canvasSize.height;
+      const sx = rect.x * scaleX;
+      const sy = rect.y * scaleY;
+      const sw = Math.max(1, rect.w * scaleX);
+      const sh = Math.max(1, rect.h * scaleY);
+      const out = document.createElement("canvas");
+      out.width = Math.round(sw);
+      out.height = Math.round(sh);
+      const ctx = out.getContext("2d");
+      if (!ctx) return null;
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+      return out.toDataURL("image/png");
+    },
+    [canvasSize.width, canvasSize.height]
+  );
+
+  const handleAskCancel = useCallback(() => {
+    setIsAskMode(false);
+    setAskRect(null);
+    setAskDraft("");
+    askDragRef.current = null;
+  }, []);
+
+  const handleAskSubmit = useCallback(async () => {
+    if (!askRect || !askDraft.trim()) return;
+    const question = askDraft.trim();
+    setIsAskSubmitting(true);
+    try {
+      const croppedImage = await cropSnapshotToRect(askRect);
+      if (!croppedImage) {
+        setToast({ message: "Could not capture region.", key: Date.now() });
+        return;
+      }
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image: croppedImage,
+          subject,
+          session_id: SESSION_ID,
+          tutor_mode: tutorMode,
+          question,
+        }),
+      });
+      if (!res.ok) {
+        setToast({ message: `Analysis failed: ${res.status}`, key: Date.now() });
+        return;
+      }
+      const data: AnnotationResponse = await res.json();
+      const mapped: AnnotationResponse = {
+        ...data,
+        annotations: (data.annotations ?? []).map((ann) => ({
+          ...ann,
+          bbox: [ann.bbox[0] + askRect.x, ann.bbox[1] + askRect.y, ann.bbox[2], ann.bbox[3]],
+        })),
+      };
+      applyResult(mapped);
+      if (data.summary?.trim()) {
+        setToast({ message: data.summary, key: Date.now() });
+        if (isConnected) sendTextMessage(data.summary);
+      }
+      setIsAskMode(false);
+      setAskRect(null);
+      setAskDraft("");
+      askDragRef.current = null;
+    } catch (err) {
+      console.error("Ask region error:", err);
+      setToast({ message: "Something went wrong. Try again.", key: Date.now() });
+    } finally {
+      setIsAskSubmitting(false);
+    }
+  }, [
+    askRect,
+    askDraft,
+    cropSnapshotToRect,
+    subject,
+    tutorMode,
+    applyResult,
+    isConnected,
+    sendTextMessage,
+  ]);
 
   return (
     <div
@@ -315,6 +484,35 @@ export default function Home() {
           Eraser
         </button>
 
+        {/* Ask: draw a box and ask a question about that region */}
+        <button
+          type="button"
+          onClick={handleAskToggle}
+          aria-pressed={isAskMode}
+          title="Draw a box around an area, then ask a question about it"
+          className={[
+            "flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-md border transition-colors flex-shrink-0",
+            isAskMode
+              ? "bg-violet-100 border-violet-400 text-violet-800 font-medium"
+              : "bg-white border-gray-200 text-gray-600 hover:border-violet-300 hover:bg-violet-50/50",
+          ].join(" ")}
+        >
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            className="h-3.5 w-3.5"
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            aria-hidden="true"
+          >
+            <path
+              fillRule="evenodd"
+              d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-8-3a1 1 0 00-.867.5 1 1 0 11-1.731-.A3 3 0 0113 8a3.001 3.001 0 01-2 2.83V11a1 1 0 11-2 0v-1a1 1 0 011-1 1 1 0 100-2zm0 8a1 1 0 100-2 1 1 0 000 2z"
+              clipRule="evenodd"
+            />
+          </svg>
+          Ask
+        </button>
+
         {/* Clear canvas */}
         <button
           onClick={handleClearCanvas}
@@ -398,6 +596,85 @@ export default function Home() {
             canvasHeight={canvasSize.height}
             onDismiss={handleDismissAnnotation}
           />
+
+          {/* Ask mode: draw bounding box then type question; screenshot of box + question sent to Gemini */}
+          <div
+            className="absolute inset-0"
+            style={{
+              pointerEvents: isAskMode ? "auto" : "none",
+              cursor: isAskMode ? "crosshair" : "default",
+            }}
+            onPointerDown={handleAskPointerDown}
+            onPointerMove={handleAskPointerMove}
+            onPointerUp={handleAskPointerUp}
+            onPointerLeave={handleAskPointerUp}
+          >
+            {askRect && askRect.w >= 10 && askRect.h >= 10 && (
+              <>
+                <div
+                  style={{
+                    position: "absolute",
+                    left: askRect.x,
+                    top: askRect.y,
+                    width: askRect.w,
+                    height: askRect.h,
+                    borderRadius: 4,
+                    border: "2px solid rgba(129, 140, 248, 0.9)",
+                    backgroundColor: "rgba(129, 140, 248, 0.08)",
+                  }}
+                />
+                <div
+                  data-ask-ui
+                  style={{
+                    position: "absolute",
+                    left: Math.min(Math.max(askRect.x, 8), Math.max(8, canvasSize.width - 280)),
+                    top: Math.max(8, askRect.y - 88),
+                    maxWidth: 280,
+                  }}
+                  className="z-20"
+                  onPointerDown={(e) => e.stopPropagation()}
+                >
+                  <div className="rounded-lg bg-white shadow-lg border border-gray-200 p-2.5 space-y-1.5">
+                    <div className="text-[11px] text-gray-500">Ask about this region</div>
+                    <textarea
+                      rows={2}
+                      className="w-full text-xs border border-gray-200 rounded px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-violet-400 focus:border-violet-400 resize-none"
+                      placeholder="Type your question…"
+                      value={askDraft}
+                      onChange={(e) => setAskDraft(e.target.value)}
+                      onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          handleAskSubmit();
+                        }
+                      }}
+                    />
+                    <div className="flex justify-end gap-1.5 pt-0.5">
+                      <button
+                        type="button"
+                        onClick={handleAskCancel}
+                        className="px-2.5 py-1 text-[11px] rounded border border-gray-200 text-gray-500 hover:bg-gray-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAskSubmit()}
+                        disabled={!askDraft.trim() || isAskSubmitting}
+                        className={`px-3 py-1 text-[11px] rounded text-white ${
+                          askDraft.trim() && !isAskSubmitting
+                            ? "bg-violet-500 hover:bg-violet-600"
+                            : "bg-violet-300 cursor-not-allowed"
+                        }`}
+                      >
+                        {isAskSubmitting ? "Sending…" : "Ask"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
